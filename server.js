@@ -1,11 +1,24 @@
-const express = require("express");
-const app = express();
+const WebSocket = require("ws");
 
-app.get("/", (req, res) => {
-  res.send("TalkToSmile Server Running!");
+const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
+
+let clients = [];
+
+wss.on("connection", function(ws) {
+  clients.push(ws);
+
+  ws.on("message", function(message) {
+    // send message to any other connected user
+    clients.forEach(client => {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        client.send(message.toString());
+      }
+    });
+  });
+
+  ws.on("close", function() {
+    clients = clients.filter(client => client !== ws);
+  });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server started on port " + PORT);
-});
+console.log("WebSocket server running");
