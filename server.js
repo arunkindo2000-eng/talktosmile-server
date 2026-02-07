@@ -1,14 +1,12 @@
 const WebSocket = require("ws");
 
-const wss = new WebSocket.Server({
-  port: process.env.PORT || 3000
-});
+const PORT = process.env.PORT || 3000;
+const wss = new WebSocket.Server({ port: PORT });
 
 let waitingUser = null;
 
-wss.on("connection", function (ws) {
+wss.on("connection", (ws) => {
 
-  // pairing logic
   if (waitingUser === null) {
     waitingUser = ws;
     ws.send("Waiting for a stranger...");
@@ -22,24 +20,21 @@ wss.on("connection", function (ws) {
     waitingUser = null;
   }
 
-  // message forward
-  ws.on("message", function (msg) {
+  ws.on("message", (msg) => {
     if (ws.partner && ws.partner.readyState === WebSocket.OPEN) {
       ws.partner.send(msg.toString());
     }
   });
 
-  // disconnect handling
-  ws.on("close", function () {
+  ws.on("close", () => {
     if (ws.partner) {
-      ws.partner.send("Stranger disconnected");
+      ws.partner.send("Stranger disconnected.");
       ws.partner.partner = null;
     }
     if (waitingUser === ws) {
       waitingUser = null;
     }
   });
-
 });
 
-console.log("WebSocket server running");
+console.log("WebSocket server running on port", PORT);
