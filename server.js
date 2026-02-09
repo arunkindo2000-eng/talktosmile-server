@@ -1,40 +1,51 @@
-const WebSocket = require("ws");
+let socket;
+let chatBox = document.getElementById("chatBox");
+let statusText = document.getElementById("status");
+let msgInput = document.getElementById("msgInput");
 
-const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
+function startChat() {
+  socket = new WebSocket("wss://echo.websocket.events");
 
-let waitingUser = null;
+  statusText.innerText = "Status: Connecting...";
 
-wss.on("connection", (ws) => {
+  socket.onopen = () => {
+    statusText.innerText = "Status: Connected";
+    addMessage("System", "Waiting for a stranger...");
+  };
 
-  if (waitingUser === null) {
-    waitingUser = ws;
-    ws.send("Waiting for a stranger...");
-  } else {
-    ws.partner = waitingUser;
-    waitingUser.partner = ws;
+  socket.onmessage = (event) => {
+    addMessage("Stranger", event.data);
+  };
 
-    ws.send("Stranger connected!");
-    waitingUser.send("Stranger connected!");
+  socket.onclose = () => {
+    statusText.innerText = "Status: Disconnected";
+  };
+}
 
-    waitingUser = null;
-  }
+function sendMessage() {
+  if (!socket || socket.readyState !== 1) return;
 
-  ws.on("message", (msg) => {
-    if (ws.partner && ws.partner.readyState === WebSocket.OPEN) {
-      ws.partner.send(msg.toString());
-    }
-  });
+  let msg = msgInput.value.trim();
+  if (msg === "") return;
 
-  ws.on("close", () => {
-    if (ws.partner) {
-      ws.partner.send("Stranger disconnected.");
-      ws.partner.partner = null;
-    }
-    if (waitingUser === ws) {
-      waitingUser = null;
-    }
-  });
-});
+  addMessage("You", msg);
+  socket.send(msg);
+  msgInput.value = "";
+}
 
-console.log("WebSocket server running on port", PORT);
+function disconnectChat() {
+  if (socket) socket.close();
+}
+
+function nextChat() {
+  disconnectChat();
+  chatBox.innerHTML = "";
+  startChat();
+}
+
+function addMessage(sender, text) {
+  let div = document.createElement("div");
+  div.innerText = sender + ": " + text;
+  chatBox.appendChild(div);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
