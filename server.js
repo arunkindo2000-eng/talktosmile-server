@@ -1,51 +1,31 @@
-let socket;
-let chatBox = document.getElementById("chatBox");
-let statusText = document.getElementById("status");
-let msgInput = document.getElementById("msgInput");
+const socket = io("https://talktosmile-server.onrender.com");
+
+const status = document.getElementById("status");
+const chatBox = document.getElementById("chatBox");
+const msgInput = document.getElementById("msgInput");
+
+socket.on("connect", () => {
+  status.innerText = "Status: Connected";
+});
+
+socket.on("disconnect", () => {
+  status.innerText = "Status: Disconnected";
+});
+
+socket.on("message", (msg) => {
+  const div = document.createElement("div");
+  div.innerText = msg;
+  chatBox.appendChild(div);
+});
 
 function startChat() {
-  socket = new WebSocket("wss://echo.websocket.events");
-
-  statusText.innerText = "Status: Connecting...";
-
-  socket.onopen = () => {
-    statusText.innerText = "Status: Connected";
-    addMessage("System", "Waiting for a stranger...");
-  };
-
-  socket.onmessage = (event) => {
-    addMessage("Stranger", event.data);
-  };
-
-  socket.onclose = () => {
-    statusText.innerText = "Status: Disconnected";
-  };
+  socket.emit("start");
+  status.innerText = "Status: Waiting for stranger...";
 }
 
 function sendMessage() {
-  if (!socket || socket.readyState !== 1) return;
-
-  let msg = msgInput.value.trim();
-  if (msg === "") return;
-
-  addMessage("You", msg);
-  socket.send(msg);
+  const msg = msgInput.value;
+  if (msg.trim() === "") return;
+  socket.emit("message", msg);
   msgInput.value = "";
-}
-
-function disconnectChat() {
-  if (socket) socket.close();
-}
-
-function nextChat() {
-  disconnectChat();
-  chatBox.innerHTML = "";
-  startChat();
-}
-
-function addMessage(sender, text) {
-  let div = document.createElement("div");
-  div.innerText = sender + ": " + text;
-  chatBox.appendChild(div);
-  chatBox.scrollTop = chatBox.scrollHeight;
 }
