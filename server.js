@@ -1,31 +1,16 @@
-const socket = io("https://talktosmile-server.onrender.com");
+const socket = new WebSocket("wss://echo.websocket.events");
 
-const status = document.getElementById("status");
-const chatBox = document.getElementById("chatBox");
-const msgInput = document.getElementById("msgInput");
+socket.onopen = () => {
+    document.getElementById("status").innerText = "Status: Connected";
+};
 
-socket.on("connect", () => {
-  status.innerText = "Status: Connected";
-});
-
-socket.on("disconnect", () => {
-  status.innerText = "Status: Disconnected";
-});
-
-socket.on("message", (msg) => {
-  const div = document.createElement("div");
-  div.innerText = msg;
-  chatBox.appendChild(div);
-});
-
-function startChat() {
-  socket.emit("start");
-  status.innerText = "Status: Waiting for stranger...";
-}
+socket.onmessage = (event) => {
+    const chatBox = document.getElementById("chat");
+    chatBox.innerHTML += "<div>" + event.data + "</div>";
+};
 
 function sendMessage() {
-  const msg = msgInput.value;
-  if (msg.trim() === "") return;
-  socket.emit("message", msg);
-  msgInput.value = "";
+    const input = document.getElementById("messageInput");
+    socket.send(input.value);
+    input.value = "";
 }
