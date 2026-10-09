@@ -1,11 +1,13 @@
 {
   "name": "talktosmile-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "TalkToSmile random chat server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "socket.io": "^4.8.1"
   }
 }
