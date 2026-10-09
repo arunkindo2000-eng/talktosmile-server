@@ -14,10 +14,12 @@ const io = new Server(server, {
   }
 });
 
-app.use(express.static(path.join(__dirname, "public")));
-
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  res.status(200).json({
+    name: "TalkToSmile Server",
+    status: "running",
+    message: "Socket.IO server is ready"
+  });
 });
 
 const waitingUsers = new Map();
