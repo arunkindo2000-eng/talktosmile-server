@@ -8,10 +8,10 @@ const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  pingInterval: 20000,
+  pingTimeout: 60000,
+  transports: ["websocket", "polling"]
 });
 
 app.get("/", (req, res) => {
@@ -21,7 +21,7 @@ app.get("/", (req, res) => {
     message: "Socket.IO server is ready"
   });
 });
-
+app.get("/health", (req, res) => res.send("ok"));
 const waitingUsers = new Map();
 const activeRooms = new Map();
 
