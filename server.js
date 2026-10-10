@@ -105,7 +105,7 @@ io.on("connection", (socket) => {
   console.log("Connected:", socket.id);
 
   socket.on("start-chat", (username) => {
-    leaveRoom(socket, false);
+    leaveRoom(socket, true);
 
     for (const [id, user] of waitingUsers) {
       if (id === socket.id) waitingUsers.delete(id);
