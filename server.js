@@ -1,200 +1,405 @@
+JavaScript
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
 
-// Production me ALLOWED_ORIGINS set karo, e.g. "https://talktosmile.com,https://www.talktosmile.com"
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(",").map((s) => s.trim())
-  : "*";
+// ======================================
+// CONFIGURATION
+// ======================================
+
+const PORT = process.env.PORT || 3000;
+
+const allowedOrigins = (
+  process.env.ALLOWED_ORIGINS ||
+  "https://talktosmile.online,https://www.talktosmile.online"
+)
+  .split(",")
+  .map(origin => origin.trim())
+  .filter(Boolean);
 
 const io = new Server(server, {
-  cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
-  pingInterval: 10000,
-  pingTimeout: 15000, // pehle 60000 tha -> ghost users ~80s tak rehte the
+  cors: {
+    origin: allowedOrigins,
+    methods: ["GET", "POST"]
+  },
   transports: ["websocket", "polling"],
-  maxHttpBufferSize: 1e5 // 100 KB, bade payloads block
+  pingInterval: 25000,
+  pingTimeout: 20000,
+  connectTimeout: 20000
 });
+
+app.use(express.json());
+
+// ======================================
+// DATA
+// ======================================
+
+// Waiting users: socketId -> username
+const waitingUsers = new Map();
+
+// Active users: socketId -> partnerSocketId
+const activeUsers = new Map();
+
+// Rooms: roomId -> { user1, user2 }
+const activeRooms = new Map();
+
+// Usernames: socketId -> username
+const usernames = new Map();
+
+// Message rate limiting
+const messageLimits = new Map();
+
+// ======================================
+// BASIC ROUTES
+// ======================================
 
 app.get("/", (req, res) => {
-  res.status(200).json({
+  res.json({
     name: "TalkToSmile Server",
     status: "running",
-    message: "Socket.IO server is ready"
+    features: [
+      "Random matching",
+      "Text chat",
+      "WebRTC signaling",
+      "Voice chat support",
+      "Next stranger",
+      "Disconnect"
+    ]
   });
 });
-app.get("/health", (req, res) => res.send("ok"));
 
-const waitingUsers = new Map(); // socketId -> socket
-const activeRooms = new Map(); // roomId -> { members: [id, id] }
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    online: io.engine.clientsCount
+  });
+});
 
-/* ---------- Simple rate limiter (per socket) ---------- */
-function allow(socket, key, limit, windowMs) {
-  const now = Date.now();
-  socket.data.rl = socket.data.rl || {};
-  const bucket = socket.data.rl[key] || { count: 0, start: now };
+// ======================================
+// ONLINE COUNT
+// ======================================
 
-  if (now - bucket.start > windowMs) {
-    bucket.count = 0;
-    bucket.start = now;
-  }
-
-  bucket.count++;
-  socket.data.rl[key] = bucket;
-  return bucket.count <= limit;
+function broadcastOnlineCount() {
+  io.emit("online-count", io.engine.clientsCount);
 }
 
-/* ---------- Room helpers ---------- */
-function leaveRoom(socket, notify = true) {
-  waitingUsers.delete(socket.id);
+// ======================================
+// HELPERS
+// ======================================
 
-  const roomId = socket.data.roomId;
-  if (!roomId) return;
+function cleanUsername(value) {
+  if (typeof value !== "string") return "Guest";
 
-  const room = activeRooms.get(roomId);
+  const name = value.trim().slice(0, 24);
 
-  socket.data.roomId = null;
-  socket.data.partnerId = null;
-  socket.leave(roomId);
+  return name || "Guest";
+}
 
-  if (!room) return;
+function removeFromWaiting(socketId) {
+  waitingUsers.delete(socketId);
+}
 
-  const partnerId = room.members.find((id) => id !== socket.id);
-  activeRooms.delete(roomId);
+function getPartner(socketId) {
+  return activeUsers.get(socketId);
+}
 
-  if (partnerId) {
-    const partner = io.sockets.sockets.get(partnerId);
+function getRoom(socketId) {
+  const partnerId = getPartner(socketId);
 
-    if (partner) {
-      partner.leave(roomId); // FIX: pehle partner room me joined reh jata tha
-      partner.data.roomId = null;
-      partner.data.partnerId = null;
+  if (!partnerId) return null;
 
-      if (notify) {
-        partner.emit("partner-disconnected");
-      }
+  for (const [roomId, room] of activeRooms.entries()) {
+    if (
+      (room.user1 === socketId && room.user2 === partnerId) ||
+      (room.user2 === socketId && room.user1 === partnerId)
+    ) {
+      return roomId;
     }
   }
+
+  return null;
 }
+
+// ======================================
+// END ACTIVE CHAT
+// ======================================
+
+function leaveChat(socketId, notifyPartner = true) {
+  removeFromWaiting(socketId);
+
+  const partnerId = getPartner(socketId);
+
+  if (!partnerId) return;
+
+  const roomId = getRoom(socketId);
+
+  activeUsers.delete(socketId);
+  activeUsers.delete(partnerId);
+
+  if (roomId) {
+    activeRooms.delete(roomId);
+  }
+
+  if (notifyPartner) {
+    io.to(partnerId).emit("partner-disconnected");
+  }
+}
+
+// ======================================
+// RANDOM MATCHING
+// ======================================
 
 function findMatch(socket) {
-  if (!socket.connected || socket.data.roomId) return;
+  if (!socket.connected) return;
 
-  for (const [id, user] of waitingUsers) {
-    if (id === socket.id) continue;
+  const socketId = socket.id;
 
-    // Disconnected ya stale socket ko queue se hata do
-    if (!user.connected) {
-      waitingUsers.delete(id);
-      continue;
+  // Avoid duplicate queue entries.
+  removeFromWaiting(socketId);
+
+  // Leave any previous chat.
+  leaveChat(socketId, true);
+
+  const username = usernames.get(socketId) || "Guest";
+
+  // Find a valid waiting user.
+  let partnerId = null;
+
+  for (const waitingId of waitingUsers.keys()) {
+    if (
+      waitingId !== socketId &&
+      io.sockets.sockets.has(waitingId) &&
+      !activeUsers.has(waitingId)
+    ) {
+      partnerId = waitingId;
+      break;
     }
 
-    waitingUsers.delete(id);
+    waitingUsers.delete(waitingId);
+  }
 
-    const roomId = "room_" + socket.id + "_" + id;
+  // No available partner: add to queue.
+  if (!partnerId) {
+    waitingUsers.set(socketId, username);
 
-    activeRooms.set(roomId, { members: [socket.id, id] });
-
-    socket.join(roomId);
-    user.join(roomId);
-
-    socket.data.roomId = roomId;
-    socket.data.partnerId = id;
-
-    user.data.roomId = roomId;
-    user.data.partnerId = socket.id;
-
-    // initiator: jo naya aaya (socket) woh WebRTC offer banayega.
-    // Isse dono taraf se ek saath offer bhejne ki problem (glare) nahi hoti.
-    socket.emit("matched", {
-      roomId,
-      partnerId: id,
-      username: user.data.username || "Stranger",
-      initiator: true
-    });
-
-    user.emit("matched", {
-      roomId,
-      partnerId: socket.id,
-      username: socket.data.username || "Stranger",
-      initiator: false
-    });
+    socket.emit("waiting");
 
     return;
   }
 
-  waitingUsers.set(socket.id, socket);
-  socket.emit("waiting");
+  // Remove partner from waiting queue.
+  const partnerUsername =
+    waitingUsers.get(partnerId) || "Guest";
+
+  waitingUsers.delete(partnerId);
+
+  // Create private room.
+  const roomId = crypto.randomUUID();
+
+  activeUsers.set(socketId, partnerId);
+  activeUsers.set(partnerId, socketId);
+
+  activeRooms.set(roomId, {
+    user1: partnerId,
+    user2: socketId
+  });
+
+  // First waiting user becomes initiator.
+  io.to(partnerId).emit("matched", {
+    roomId,
+    partnerId: socketId,
+    username,
+    initiator: true
+  });
+
+  socket.emit("matched", {
+    roomId,
+    partnerId,
+    username: partnerUsername,
+    initiator: false
+  });
+
+  console.log(
+    `MATCH: ${partnerUsername} <-> ${username}`
+  );
 }
 
-/* ---------- Socket events ---------- */
+// ======================================
+// MESSAGE RATE LIMIT
+// ======================================
+
+function canSendMessage(socketId) {
+  const now = Date.now();
+
+  const previous = messageLimits.get(socketId) || [];
+
+  const recent = previous.filter(
+    timestamp => now - timestamp < 5000
+  );
+
+  if (recent.length >= 15) {
+    messageLimits.set(socketId, recent);
+    return false;
+  }
+
+  recent.push(now);
+  messageLimits.set(socketId, recent);
+
+  return true;
+}
+
+// ======================================
+// SOCKET CONNECTION
+// ======================================
+
 io.on("connection", (socket) => {
-  console.log("Connected:", socket.id);
+  console.log("USER CONNECTED:", socket.id);
 
-  socket.on("start-chat", (username) => {
-    if (!allow(socket, "start", 5, 10000)) return;
+  usernames.set(socket.id, "Guest");
 
-    leaveRoom(socket, true);
+  broadcastOnlineCount();
 
-    socket.data.username = String(username || "Stranger")
-      .replace(/[<>]/g, "") // basic sanitize; frontend me bhi textContent use karo
-      .trim()
-      .slice(0, 20) || "Stranger";
+  // ----------------------------------
+  // START CHAT
+  // ----------------------------------
+
+  socket.on("start-chat", (data) => {
+    const username = cleanUsername(
+      typeof data === "string" ? data : data?.username
+    );
+
+    usernames.set(socket.id, username);
 
     findMatch(socket);
   });
 
-  socket.on("message", (text) => {
-    if (!allow(socket, "msg", 10, 5000)) return; // 5 sec me max 10 msgs
-
-    const roomId = socket.data.roomId;
-    if (!roomId || typeof text !== "string") return;
-
-    const message = text.trim().slice(0, 500);
-    if (!message) return;
-
-    socket.to(roomId).emit("message", {
-      sender: socket.id,
-      username: socket.data.username || "Stranger",
-      text: message,
-      timestamp: Date.now()
-    });
-  });
-
-  /* ---------- WebRTC signaling (voice chat ke liye zaroori) ---------- */
-  ["offer", "answer", "ice-candidate"].forEach((evt) => {
-    socket.on(evt, (data) => {
-      if (!allow(socket, "signal", 100, 10000)) return;
-
-      const partnerId = socket.data.partnerId;
-      if (!partnerId) return;
-
-      // sirf apne current partner ko forward karo
-      io.to(partnerId).emit(evt, data);
-    });
-  });
+  // ----------------------------------
+  // NEXT STRANGER
+  // ----------------------------------
 
   socket.on("next-stranger", () => {
-    if (!allow(socket, "next", 5, 10000)) return;
+    const username = usernames.get(socket.id) || "Guest";
 
-    leaveRoom(socket);
+    leaveChat(socket.id, true);
+
+    usernames.set(socket.id, username);
+
     findMatch(socket);
   });
 
+  // ----------------------------------
+  // STOP CHAT
+  // ----------------------------------
+
   socket.on("stop-chat", () => {
-    leaveRoom(socket);
+    leaveChat(socket.id, true);
+
+    socket.emit("chat-stopped");
   });
 
-  socket.on("disconnect", () => {
-    leaveRoom(socket);
-    console.log("Disconnected:", socket.id);
+  // ----------------------------------
+  // TEXT MESSAGE
+  // ----------------------------------
+
+  socket.on("message", (data) => {
+    if (!canSendMessage(socket.id)) return;
+
+    const partnerId = getPartner(socket.id);
+
+    if (!partnerId) return;
+
+    const text = (
+      typeof data === "string"
+        ? data
+        : data?.text
+    );
+
+    if (typeof text !== "string") return;
+
+    const message = text.trim().slice(0, 2000);
+
+    if (!message) return;
+
+    io.to(partnerId).emit("message", {
+      text: message,
+      username: usernames.get(socket.id) || "Guest"
+    });
+  });
+
+  // ==================================
+  // WEBRTC SIGNALING
+  // ==================================
+
+  function forwardSignal(eventName, data) {
+    const partnerId = getPartner(socket.id);
+
+    if (!partnerId) return;
+
+    const roomId = getRoom(socket.id);
+
+    if (!roomId) return;
+
+    // Ignore signals for stale or incorrect rooms.
+    if (
+      data &&
+      typeof data === "object" &&
+      data.roomId &&
+      data.roomId !== roomId
+    ) {
+      return;
+    }
+
+    io.to(partnerId).emit(eventName, data);
+  }
+
+  socket.on("offer", (data) => {
+    forwardSignal("offer", data);
+  });
+
+  socket.on("answer", (data) => {
+    forwardSignal("answer", data);
+  });
+
+  socket.on("ice-candidate", (data) => {
+    forwardSignal("ice-candidate", data);
+  });
+
+  // ----------------------------------
+  // END VOICE
+  // ----------------------------------
+
+  socket.on("voice-end", () => {
+    const partnerId = getPartner(socket.id);
+
+    if (partnerId) {
+      io.to(partnerId).emit("voice-end");
+    }
+  });
+
+  // ----------------------------------
+  // DISCONNECT
+  // ----------------------------------
+
+  socket.on("disconnect", (reason) => {
+    console.log("USER DISCONNECTED:", socket.id, reason);
+
+    leaveChat(socket.id, true);
+
+    usernames.delete(socket.id);
+    messageLimits.delete(socket.id);
+
+    broadcastOnlineCount();
   });
 });
 
-const PORT = process.env.PORT || 3000;
+// ======================================
+// SERVER START
+// ======================================
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("TalkToSmile server running on port", PORT);
+  console.log(`TalkToSmile server running on port ${PORT}`);
 });
