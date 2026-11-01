@@ -263,6 +263,8 @@ io.on("connection", (socket) => {
 
   usernames.set(socket.id, "Guest");
 
+  // Send the count straight to the new user, then update everyone.
+  socket.emit("online-count", io.engine.clientsCount);
   broadcastOnlineCount();
 
   // ----------------------------------
