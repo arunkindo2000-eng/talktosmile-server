@@ -12,26 +12,44 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || 3000;
 
+// Comma separated list. Use "*" to allow every origin (testing only).
 const allowedOrigins = (
   process.env.ALLOWED_ORIGINS ||
   "https://talktosmile.online,https://www.talktosmile.online"
 )
   .split(",")
-  .map(origin => origin.trim())
+  .map((origin) => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
+
+const allowAllOrigins = allowedOrigins.includes("*");
+
+const MAX_USERNAME_LENGTH = 20; // matches the frontend input
+const MAX_MESSAGE_LENGTH = 500; // matches the frontend input
+
+// Behind Render / Railway / Nginx proxies.
+app.set("trust proxy", 1);
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      // No origin = non-browser clients or same-origin requests.
+      if (!origin || allowAllOrigins || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.warn("BLOCKED ORIGIN:", origin);
+      return callback(null, false);
+    },
     methods: ["GET", "POST"]
   },
   transports: ["websocket", "polling"],
   pingInterval: 25000,
   pingTimeout: 20000,
-  connectTimeout: 20000
+  connectTimeout: 20000,
+  maxHttpBufferSize: 1e5 // 100 KB is plenty for chat and WebRTC signaling
 });
 
-app.use(express.json());
+app.use(express.json({ limit: "10kb" }));
 
 // ======================================
 // DATA
@@ -43,14 +61,17 @@ const waitingUsers = new Map();
 // Active users: socketId -> partnerSocketId
 const activeUsers = new Map();
 
-// Rooms: roomId -> { user1, user2 }
-const activeRooms = new Map();
+// Room lookup: socketId -> roomId
+const roomOf = new Map();
 
 // Usernames: socketId -> username
 const usernames = new Map();
 
-// Message rate limiting
+// Message rate limiting: socketId -> timestamps
 const messageLimits = new Map();
+
+// Signaling rate limiting: socketId -> timestamps
+const signalLimits = new Map();
 
 // ======================================
 // BASIC ROUTES
@@ -74,8 +95,15 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.status(200).json({
     status: "ok",
-    online: io.engine.clientsCount
+    online: io.engine.clientsCount,
+    waiting: waitingUsers.size,
+    chatting: activeUsers.size
   });
+});
+
+// Lightweight endpoint for uptime pingers (keeps free hosts awake).
+app.get("/ping", (req, res) => {
+  res.status(200).send("pong");
 });
 
 // ======================================
@@ -93,7 +121,10 @@ function broadcastOnlineCount() {
 function cleanUsername(value) {
   if (typeof value !== "string") return "Guest";
 
-  const name = value.trim().slice(0, 24);
+  const name = value
+    .replace(/[\u0000-\u001F\u007F<>]/g, "") // strip control chars and angle brackets
+    .trim()
+    .slice(0, MAX_USERNAME_LENGTH);
 
   return name || "Guest";
 }
@@ -107,20 +138,25 @@ function getPartner(socketId) {
 }
 
 function getRoom(socketId) {
-  const partnerId = getPartner(socketId);
+  return roomOf.get(socketId) || null;
+}
 
-  if (!partnerId) return null;
+function isWithinLimit(map, socketId, maxCount, windowMs) {
+  const now = Date.now();
 
-  for (const [roomId, room] of activeRooms.entries()) {
-    if (
-      (room.user1 === socketId && room.user2 === partnerId) ||
-      (room.user2 === socketId && room.user1 === partnerId)
-    ) {
-      return roomId;
-    }
+  const recent = (map.get(socketId) || []).filter(
+    (timestamp) => now - timestamp < windowMs
+  );
+
+  if (recent.length >= maxCount) {
+    map.set(socketId, recent);
+    return false;
   }
 
-  return null;
+  recent.push(now);
+  map.set(socketId, recent);
+
+  return true;
 }
 
 // ======================================
@@ -134,14 +170,11 @@ function leaveChat(socketId, notifyPartner = true) {
 
   if (!partnerId) return;
 
-  const roomId = getRoom(socketId);
-
   activeUsers.delete(socketId);
   activeUsers.delete(partnerId);
 
-  if (roomId) {
-    activeRooms.delete(roomId);
-  }
+  roomOf.delete(socketId);
+  roomOf.delete(partnerId);
 
   if (notifyPartner) {
     io.to(partnerId).emit("partner-disconnected");
@@ -157,43 +190,41 @@ function findMatch(socket) {
 
   const socketId = socket.id;
 
-  // Avoid duplicate queue entries.
-  removeFromWaiting(socketId);
-
-  // Leave any previous chat.
+  // Leave any previous chat and avoid duplicate queue entries.
   leaveChat(socketId, true);
+  removeFromWaiting(socketId);
 
   const username = usernames.get(socketId) || "Guest";
 
-  // Find a valid waiting user.
+  // Find a valid waiting user (oldest first).
   let partnerId = null;
 
-  for (const waitingId of waitingUsers.keys()) {
+  for (const waitingId of [...waitingUsers.keys()]) {
+    const stillConnected = io.sockets.sockets.has(waitingId);
+
     if (
       waitingId !== socketId &&
-      io.sockets.sockets.has(waitingId) &&
+      stillConnected &&
       !activeUsers.has(waitingId)
     ) {
       partnerId = waitingId;
       break;
     }
 
-    waitingUsers.delete(waitingId);
+    // Clean up stale entries.
+    if (!stillConnected) {
+      waitingUsers.delete(waitingId);
+    }
   }
 
-  // No available partner: add to queue.
+  // No available partner: join the queue.
   if (!partnerId) {
     waitingUsers.set(socketId, username);
-
     socket.emit("waiting");
-
     return;
   }
 
-  // Remove partner from waiting queue.
-  const partnerUsername =
-    waitingUsers.get(partnerId) || "Guest";
-
+  const partnerUsername = waitingUsers.get(partnerId) || "Guest";
   waitingUsers.delete(partnerId);
 
   // Create private room.
@@ -202,12 +233,10 @@ function findMatch(socket) {
   activeUsers.set(socketId, partnerId);
   activeUsers.set(partnerId, socketId);
 
-  activeRooms.set(roomId, {
-    user1: partnerId,
-    user2: socketId
-  });
+  roomOf.set(socketId, roomId);
+  roomOf.set(partnerId, roomId);
 
-  // First waiting user becomes initiator.
+  // First waiting user becomes the WebRTC initiator.
   io.to(partnerId).emit("matched", {
     roomId,
     partnerId: socketId,
@@ -222,33 +251,7 @@ function findMatch(socket) {
     initiator: false
   });
 
-  console.log(
-    `MATCH: ${partnerUsername} <-> ${username}`
-  );
-}
-
-// ======================================
-// MESSAGE RATE LIMIT
-// ======================================
-
-function canSendMessage(socketId) {
-  const now = Date.now();
-
-  const previous = messageLimits.get(socketId) || [];
-
-  const recent = previous.filter(
-    timestamp => now - timestamp < 5000
-  );
-
-  if (recent.length >= 15) {
-    messageLimits.set(socketId, recent);
-    return false;
-  }
-
-  recent.push(now);
-  messageLimits.set(socketId, recent);
-
-  return true;
+  console.log(`MATCH: ${partnerUsername} <-> ${username}`);
 }
 
 // ======================================
@@ -281,12 +284,7 @@ io.on("connection", (socket) => {
   // ----------------------------------
 
   socket.on("next-stranger", () => {
-    const username = usernames.get(socket.id) || "Guest";
-
-    leaveChat(socket.id, true);
-
-    usernames.set(socket.id, username);
-
+    // findMatch already leaves the current chat and notifies the partner.
     findMatch(socket);
   });
 
@@ -305,21 +303,17 @@ io.on("connection", (socket) => {
   // ----------------------------------
 
   socket.on("message", (data) => {
-    if (!canSendMessage(socket.id)) return;
+    if (!isWithinLimit(messageLimits, socket.id, 15, 5000)) return;
 
     const partnerId = getPartner(socket.id);
 
     if (!partnerId) return;
 
-    const text = (
-      typeof data === "string"
-        ? data
-        : data?.text
-    );
+    const text = typeof data === "string" ? data : data?.text;
 
     if (typeof text !== "string") return;
 
-    const message = text.trim().slice(0, 2000);
+    const message = text.trim().slice(0, MAX_MESSAGE_LENGTH);
 
     if (!message) return;
 
@@ -334,6 +328,9 @@ io.on("connection", (socket) => {
   // ==================================
 
   function forwardSignal(eventName, data) {
+    // ICE candidates arrive in bursts, so allow a generous limit.
+    if (!isWithinLimit(signalLimits, socket.id, 200, 10000)) return;
+
     const partnerId = getPartner(socket.id);
 
     if (!partnerId) return;
@@ -355,17 +352,9 @@ io.on("connection", (socket) => {
     io.to(partnerId).emit(eventName, data);
   }
 
-  socket.on("offer", (data) => {
-    forwardSignal("offer", data);
-  });
-
-  socket.on("answer", (data) => {
-    forwardSignal("answer", data);
-  });
-
-  socket.on("ice-candidate", (data) => {
-    forwardSignal("ice-candidate", data);
-  });
+  socket.on("offer", (data) => forwardSignal("offer", data));
+  socket.on("answer", (data) => forwardSignal("answer", data));
+  socket.on("ice-candidate", (data) => forwardSignal("ice-candidate", data));
 
   // ----------------------------------
   // END VOICE
@@ -390,10 +379,37 @@ io.on("connection", (socket) => {
 
     usernames.delete(socket.id);
     messageLimits.delete(socket.id);
+    signalLimits.delete(socket.id);
 
     broadcastOnlineCount();
   });
 });
+
+// ======================================
+// ERROR HANDLING AND SHUTDOWN
+// ======================================
+
+process.on("unhandledRejection", (error) => {
+  console.error("UNHANDLED REJECTION:", error);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("UNCAUGHT EXCEPTION:", error);
+});
+
+function shutdown(signal) {
+  console.log(`${signal} received. Shutting down...`);
+
+  io.close(() => {
+    server.close(() => process.exit(0));
+  });
+
+  // Force exit if shutdown hangs.
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ======================================
 // SERVER START
@@ -401,4 +417,5 @@ io.on("connection", (socket) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`TalkToSmile server running on port ${PORT}`);
+  console.log("Allowed origins:", allowAllOrigins ? "ALL" : allowedOrigins.join(", "));
 });
